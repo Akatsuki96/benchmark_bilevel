@@ -50,31 +50,8 @@ class Solver(StochasticJaxSolver):
 
     def get_step(self, inner_sampler, outer_sampler):
 
-        grad_inner = jax.grad(self.f_inner, argnums=0)
-        grad_outer = jax.grad(self.f_outer, argnums=(0, 1))
-
-
         def _compute_grad_ffd(forward_values, current_values, directions):
             return jnp.sum(((forward_values - current_values) / self.h)[:,None] * directions, axis=0) / directions.shape[0]
-
-        # def _compute_hess_block_1(forward_values, backward_values, current_value, directions):
-
-        #     bi = (forward_values + backward_values - 2 * current_value) / (2 * self.h * self.h) 
-        #     outer_terms = directions[:, :, None] * directions[:, None, :]
-
-        #     H_b1 = jnp.einsum('n,nij->ij', bi, outer_terms - jnp.eye(directions.shape[1]))
-        #     H_b1 /= directions.shape[0]
-
-        #     # H = jnp.zeros((directions.shape[1], directions.shape[1]))
-
-        #     # for i in range(directions.shape[0]):
-        #     #     bi = (forward_values[i] + backward_values[i] - 2 * current_value) / (2 * self.h * self.h)
-        #     #     H += bi * (jnp.outer(directions[i], directions[i]) - jnp.eye(directions.shape[1]))
-
-        #     # H /= directions.shape[0]
-        #     # jax.debug.print("IS SAME APPROX: {}", jnp.linalg.norm(H - H1, ord=2))
-
-        #     return H_b1
 
         def _hvp_11(forward_values, backward_values, current_value, directions, v):
             bi = (forward_values + backward_values - 2 * current_value) / (2 * self.h * self.h) 
@@ -88,31 +65,6 @@ class Solver(StochasticJaxSolver):
             bi = (forward_values + backward_values - 2 * current_value) / (self.h * self.h) 
             proj = outer_directions @ w 
             return jnp.sum(bi[:, None] * inner_directions * proj[:, None], axis=0) / inner_directions.shape[0]
-
-
-        
-        # def _compute_hess_cross_block(forward_values, backward_values, current_value, inner_directions, outer_directions):
-
-        #     # scalar weights for each sample
-        #     bi = (forward_values + backward_values - 2 * current_value) / (self.h * self.h)  # shape (N,)
-
-        #     # Outer products for all samples: shape (N, d_in, d_out)
-        #     outer_terms = inner_directions[:, :, None] * outer_directions[:, None, :]
-
-        #     # Weighted sum across samples
-        #     H_cross = jnp.einsum('n,nij->ij', bi, outer_terms)
-
-        #     # Average across directions
-        #     H_cross /= inner_directions.shape[0]
-        #     # H = jnp.zeros((inner_directions.shape[1], outer_directions.shape[1]))
-
-        #     # for i in range(inner_directions.shape[0]):
-        #     #     bi = (forward_values[i] + backward_values[i] - 2 * current_value) / (self.h * self.h)
-        #     #     H += bi * jnp.outer(inner_directions[i], outer_directions[i])
-        #     #     #jax.debug.print("[{}] H : {}", i, H)
-        #     # H /= inner_directions.shape[0]
-        #     # jax.debug.print("IS SAME APPROX: {}", jnp.linalg.norm(H - H_cross, ord=2))
-        #     return H_cross
 
 
         ffd = jax.jit(_compute_grad_ffd)
@@ -138,16 +90,6 @@ class Solver(StochasticJaxSolver):
                 carry['state_outer_sampler']
             )
 
-
-
-        #     grad_inner_var, vjp_train = jax.vjp(
-        #         lambda z, x: grad_inner(z, x, start_inner), carry['inner_var'],
-        #         carry['outer_var']
-        #     )
-        #     hvp, cross_v = vjp_train(carry['v'])
-        #     grad_in_outer, grad_out_outer = grad_outer(
-        #        carry['inner_var'], carry['outer_var'], start_outer
-        #    )
 
             l_max = max(self.l1, self.l2)
             # Build direction matrices
