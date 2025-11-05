@@ -72,7 +72,7 @@ class Solver(StochasticJaxSolver):
         hvp_cross = jax.jit(_hvp_12)
 
 
-        def soba_one_iter(carry, _):
+        def zoba_one_iter(carry, _):
 
             _, subkey_inner = jax.random.split(carry['rnd_state_key'])
             _, subkey_outer = jax.random.split(subkey_inner)
@@ -81,7 +81,7 @@ class Solver(StochasticJaxSolver):
                 carry['state_lr']
             )
 
-            # Step.1 - get all gradients and compute the implicit gradient.
+
             start_inner, *_, carry['state_inner_sampler'] = inner_sampler(
                 carry['state_inner_sampler']
             )
@@ -121,24 +121,12 @@ class Solver(StochasticJaxSolver):
 
 
             # Compute Hessian-vector products
-#            H_block_11 = hess_b1(f_plus_values_inner, f_minus_values_inner, current_f_inner, inner_directions) @ carry['v']
+
 
             Hvp_11 = hvp_b1(f_plus_values_inner, f_minus_values_inner, current_f_inner, inner_directions, carry['v'])
 
-
-
-#            H_cross = hess_bcross(f_plus_H, f_minus_H, current_f_inner, inner_directions, outer_directions) @ carry['v']
-
             Hvp_12 = hvp_cross(f_plus_H, f_minus_H, current_f_inner, inner_directions, outer_directions, carry['v'])
 
-            # jax.debug.print("Implicit vs Exp: {}", jnp.linalg.norm(Hvp_12 - H_cross))
-            # jax.debug.print("HB 1 error: {}", jnp.linalg.norm(H_block_11 - hvp) / jnp.linalg.norm(hvp))
-            # jax.debug.print("HB imp 1 error: {}", jnp.linalg.norm(H_block_11_vp - hvp) / jnp.linalg.norm(hvp))
-            # jax.debug.print("HB Cross error: {}", jnp.linalg.norm(H_cross - cross_v) / jnp.linalg.norm(cross_v))
-            # jax.debug.print("HB Cross Impl error: {}", jnp.linalg.norm(Hvp_12 - cross_v) / jnp.linalg.norm(cross_v))
-            # jax.debug.print("Inner grad error: {}", jnp.linalg.norm(g_inner - grad_inner_var) / jnp.linalg.norm(grad_inner_var))
-            # jax.debug.print("Grad in outer error: {}", jnp.linalg.norm(g_outer_1 - grad_in_outer) / jnp.linalg.norm(grad_in_outer))
-            # jax.debug.print("Grad out outer error: {}", jnp.linalg.norm(g_outer_2 - grad_out_outer) / jnp.linalg.norm(grad_out_outer))
 
             carry['inner_var'] -= inner_step_size * g_inner
             carry['v'] -= inner_step_size * (Hvp_11 + g_outer_1)
@@ -150,4 +138,4 @@ class Solver(StochasticJaxSolver):
             return carry, _
 
 
-        return soba_one_iter
+        return zoba_one_iter
