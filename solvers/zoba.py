@@ -16,12 +16,15 @@ class Solver(StochasticJaxSolver):
 
     # any parameter defined here is accessible as a class attribute
     parameters = {
-        'step_size': [0.01],
-        'outer_ratio': [1.0],
-        'h' : [1e-3],
-        'l1' : [10],
-        'l2' : [25],
-        'batch_size': [64],
+        'step_size': [0.005],#,0.001], # stepsize for z,v
+        'outer_ratio': [1.0],#, 2.0], # stepsize for x => stepsize / outer_ratio
+        'h' : [1e-3], # smoothing parameter eta = h 
+        'l1' : [25], # number of directions for outer gradient approximation
+        'l2' : [50], # number of directions for inner gradient/hessians
+        'h_outer' : [1e-4], #[1e-3],
+        'zero_outer_smoothing' : [0],#, 1],
+#        'batch_size': [64],
+        'batch_size': [1],
         **StochasticJaxSolver.parameters
     }
 
@@ -50,8 +53,8 @@ class Solver(StochasticJaxSolver):
 
     def get_step(self, inner_sampler, outer_sampler):
 
-        def _compute_grad_ffd(forward_values, current_values, directions):
-            return jnp.sum(((forward_values - current_values) / self.h)[:,None] * directions, axis=0) / directions.shape[0]
+        def _compute_grad_ffd(forward_values, current_values, directions, h):
+            return jnp.sum(((forward_values - current_values) / h)[:,None] * directions, axis=0) / directions.shape[0]
 
         def _hvp_11(forward_values, backward_values, current_value, directions, v):
             bi = (forward_values + backward_values - 2 * current_value) / (2 * self.h * self.h) 
@@ -110,16 +113,25 @@ class Solver(StochasticJaxSolver):
             f_minus_H = jax.vmap(lambda z,x : self.f_inner(z,x, start_inner))(carry['inner_var'].reshape(1, -1) - self.h * inner_directions, carry['outer_var'].reshape(1, -1) - self.h * outer_directions)
 
             ## For g_f,1 and g_f,2
-            f_plus_values_outer_1 = jax.vmap(lambda x : self.f_outer(x, carry['outer_var'], start_outer))(carry['inner_var'].reshape(1, -1) + self.h * inner_directions[:self.l1, :])
-            f_plus_values_outer_2 = jax.vmap(lambda x : self.f_outer(carry['inner_var'], x, start_outer))(carry['outer_var'].reshape(1, -1) + self.h * outer_directions[:self.l1, :])
+
+            if self.zero_outer_smoothing == 1:
+                f_plus_values_outer_1 = jax.vmap(lambda x : self.f_outer(x, carry['outer_var'], start_outer))(carry['inner_var'].reshape(1, -1) + self.h_outer * inner_directions[:self.l1, :])
+                f_plus_values_outer_2 = jax.vmap(lambda x : self.f_outer(carry['inner_var'], x, start_outer))(carry['outer_var'].reshape(1, -1) + self.h_outer * outer_directions[:self.l1, :])
+
+            else:
+                f_plus_values_outer_1 = jax.vmap(lambda z,x : self.f_outer(z,x, start_outer))(carry['inner_var'].reshape(1, -1) + self.h_outer * inner_directions[:self.l1, :], carry['outer_var'].reshape(1, -1) + self.h_outer * outer_directions[:self.l1, :])
+#            f_plus_values_outer_2 = jax.vmap(lambda x : self.f_outer(carry['inner_var'], x, start_outer))(carry['inner_var'].reshape(1, -1) + self.h * inner_directions[:self.l1, :], carry['outer_var'].reshape(1, -1) + self.h * outer_directions[:self.l1, :])
 
 
             # Comupte gradient approximations of inner and outer functions
-            g_inner   = ffd(f_plus_values_inner[:self.l1], current_f_inner, inner_directions[:self.l1, :])
-            g_outer_1 = ffd(f_plus_values_outer_1, current_f_outer, inner_directions[:self.l1, :])
-            g_outer_2 = ffd(f_plus_values_outer_2, current_f_outer, outer_directions[:self.l1, :])
+            g_inner   = ffd(f_plus_values_inner, f_minus_values_inner, inner_directions, 2*self.h)
+            g_outer_1 = ffd(f_plus_values_outer_1, current_f_outer, inner_directions[:self.l1, :], self.h_outer)
 
-
+            if self.zero_outer_smoothing == 1:
+                g_outer_2 = ffd(f_plus_values_outer_2, current_f_outer, outer_directions[:self.l1, :], self.h_outer)
+            else:
+                # g_outer_1 = ffd(f_plus_values_outer_1, current_f_outer, inner_directions[:self.l1, :], self.h)
+                g_outer_2 = ffd(f_plus_values_outer_1, current_f_outer, outer_directions[:self.l1, :], self.h_outer)
             # Compute Hessian-vector products
 
 
