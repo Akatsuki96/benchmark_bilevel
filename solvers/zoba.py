@@ -5,34 +5,53 @@ from benchopt import safe_import_context
 with safe_import_context() as import_ctx:
     from benchmark_utils.learning_rate_scheduler import update_lr
     from benchmark_utils.learning_rate_scheduler import init_lr_scheduler
+    from benchmark_utils.zeroth_order_approx import _compute_grad_ffd, _hvp_11, _hvp_12
 
     import jax
     import jax.numpy as jnp
+    
+    
+def get_random_directions(key, b, l, dim):
+    directions = jax.random.normal(key, shape=(b, l, dim))
+    _, key = jax.random.split(key)
+    return directions, key
+
+def get_random_batch(key, b, n_samples):
+    batch_indices = jax.random.randint(key, shape=(b,), minval=0, maxval=n_samples)
+    _, key = jax.random.split(key)
+    return batch_indices, key
 
 
 class Solver(StochasticJaxSolver):
-    """Zeroth-order SOBA"""
+    """Zeroth-Order Bilevel Algorithm (ZOBA).
+
+    M. Rando and S. Vaiter, "ZOBA: An Efficient Single-loop Zeroth-order 
+    Bilevel Optimization Algorithm", ArXiv 2026."""
     name = 'ZOBA'
 
     # any parameter defined here is accessible as a class attribute
     parameters = {
-        'step_size': [0.005],#,0.001], # stepsize for z,v
-        'outer_ratio': [1.0],#, 2.0], # stepsize for x => stepsize / outer_ratio
-        'h' : [1e-3], # smoothing parameter eta = h 
-        'l1' : [25], # number of directions for outer gradient approximation
-        'l2' : [50], # number of directions for inner gradient/hessians
-        'h_outer' : [1e-4], #[1e-3],
-        'zero_outer_smoothing' : [0],#, 1],
-#        'batch_size': [64],
-        'batch_size': [1],
+        'step_size': [0.01], # stepsize for z,v
+        'outer_ratio': [2.0], # stepsize for x => stepsize / outer_ratio
+        'h' : [1e-3], # finite difference discretization parameter 
+        'l1' : [100], # number of directions for inner gradient/hessians approximations
+        'l2' : [1], # number of directions for outer gradient
+        'b1' : [25], # batch size for inner function evaluations
+        'b2' : [10], # batch size for outer function evaluations
         **StochasticJaxSolver.parameters
     }
+    batch_size = 1
 
     def init(self):
         # Init variables
         self.inner_var = self.inner_var0.copy()
         self.outer_var = self.outer_var0.copy()
         self.rnd_state_key = jax.random.PRNGKey(0)
+        self.ffd = jax.jit(_compute_grad_ffd)
+        self.hvp_b1 = jax.jit(_hvp_11)
+        self.hvp_cross = jax.jit(_hvp_12)
+
+
         v = jnp.zeros_like(self.inner_var)
 
         # Init lr scheduler
@@ -53,98 +72,87 @@ class Solver(StochasticJaxSolver):
 
     def get_step(self, inner_sampler, outer_sampler):
 
-        def _compute_grad_ffd(forward_values, current_values, directions, h):
-            return jnp.sum(((forward_values - current_values) / h)[:,None] * directions, axis=0) / directions.shape[0]
-
-        def _hvp_11(forward_values, backward_values, current_value, directions, v):
-            bi = (forward_values + backward_values - 2 * current_value) / (2 * self.h * self.h) 
-            proj = directions @ v
-            term = directions * proj[:, None]              
-            return jnp.sum(bi[:, None] * (term - v), axis=0) / directions.shape[0]
 
 
-        def _hvp_12(forward_values, backward_values, current_value, inner_directions, outer_directions, w):
-            
-            bi = (forward_values + backward_values - 2 * current_value) / (self.h * self.h) 
-            proj = outer_directions @ w 
-            return jnp.sum(bi[:, None] * inner_directions * proj[:, None], axis=0) / inner_directions.shape[0]
-
-
-        ffd = jax.jit(_compute_grad_ffd)
-        hvp_b1 = jax.jit(_hvp_11)
-        hvp_cross = jax.jit(_hvp_12)
 
 
         def zoba_one_iter(carry, _):
-
-            _, subkey_inner = jax.random.split(carry['rnd_state_key'])
-            _, subkey_outer = jax.random.split(subkey_inner)
 
             (inner_step_size, outer_step_size), carry['state_lr'] = update_lr(
                 carry['state_lr']
             )
 
-
-            start_inner, *_, carry['state_inner_sampler'] = inner_sampler(
-                carry['state_inner_sampler']
-            )
-
-            start_outer, *_, carry['state_outer_sampler'] = outer_sampler(
-                carry['state_outer_sampler']
-            )
-
-
             l_max = max(self.l1, self.l2)
-            # Build direction matrices
-            inner_directions = jax.random.normal(subkey_inner, shape=(l_max, carry['inner_var'].shape[0]))
-            outer_directions = jax.random.normal(subkey_outer, shape=(l_max, carry['outer_var'].shape[0]))
+            b_max = max(self.b1, self.b2)
+
+            # Sample directions and batches
+
+            inner_directions, subkey = get_random_directions(carry['rnd_state_key'], b_max, l_max, carry['inner_var'].shape[0])
+            outer_directions, subkey = get_random_directions(subkey, b_max, l_max, carry['outer_var'].shape[0])
+
+            inner_samples, subkey = get_random_batch(subkey, self.b1, self.n_inner_samples)
+            outer_samples, subkey = get_random_batch(subkey, self.b2, self.n_outer_samples)
+            
+            # Define function mapping for inner target
+
+            f_values_inner   = jax.vmap(jax.vmap(lambda x, xi : self.f_inner(x, carry['outer_var'], start=xi), in_axes=(0, None)), in_axes=(0, 0))
+            fz_values_outer   = jax.vmap(jax.vmap(lambda x, zeta : self.f_outer(x, carry['outer_var'], start=zeta), in_axes=(0, None)), in_axes=(0, 0))
+            fx_values_outer   = jax.vmap(jax.vmap(lambda x, zeta : self.f_outer(carry['inner_var'], x, start=zeta), in_axes=(0, None)), in_axes=(0, 0))
+            g_cross = jax.vmap(jax.vmap(lambda z, x, xi : self.f_inner(z, x, start=xi), in_axes=(0,0,None)), in_axes=(0,0,0))
+            
+            # Compute function values in current iterates for every sample i.e. g(z_k, x_k, xi_i) and f(z_k, x_k, zeta_i)
+            
+            current_f_inner = jax.vmap(lambda xi_i : self.f_inner(carry['inner_var'], carry['outer_var'], start=xi_i), in_axes=(0))(inner_samples)
+            current_f_outer = jax.vmap(lambda zeta_i : self.f_outer(carry['inner_var'], carry['outer_var'], start=zeta_i), in_axes=(0))(outer_samples)
+
+            inner_plus = carry['inner_var'] + self.h * inner_directions[:self.b1, :self.l1, :]
+            inner_minus = carry['inner_var'] - self.h * inner_directions[:self.b1, :self.l1, :]
+            outer_plus_z = carry['inner_var'].reshape(1, -1) + self.h * inner_directions[:self.b2, :self.l2, :]
+            outer_plus_x = carry['outer_var'].reshape(1, -1) + self.h * outer_directions[:self.b2, :self.l2, :]
+            cross_plus_x = carry['outer_var'].reshape(1, -1) + self.h * outer_directions[:self.b1, :self.l1, :]
+            cross_minus_x = carry['outer_var'].reshape(1, -1) - self.h * outer_directions[:self.b1, :self.l1, :]
 
 
-            # Current function values
-            current_f_inner = self.f_inner(carry['inner_var'], carry['outer_var'], start_inner)
-            current_f_outer = self.f_outer(carry['inner_var'], carry['outer_var'], start_outer)
+            # Compute g(z_k + h w_ij, x_k, xi_i) and g(z_k - h w_ij, x_k, xi_i) for i in batch and j in directions
 
-            # Compute function values for building gradients and hessians surrogates (for g_1 and H_xx)
-            f_plus_values_inner   = jax.vmap(lambda x : self.f_inner(x, carry['outer_var'], start_inner))(carry['inner_var'].reshape(1, -1) + self.h * inner_directions)
-            f_minus_values_inner  = jax.vmap(lambda x : self.f_inner(x, carry['outer_var'], start_inner))(carry['inner_var'].reshape(1, -1) - self.h * inner_directions)
+            f_plus_inner   = f_values_inner(inner_plus, inner_samples)
+            f_minus_inner  = f_values_inner(inner_minus, inner_samples)
 
-            ## For hessian cross block
-            f_plus_H  = jax.vmap(lambda z,x : self.f_inner(z,x, start_inner))(carry['inner_var'].reshape(1, -1) + self.h * inner_directions, carry['outer_var'].reshape(1, -1) + self.h * outer_directions)
-            f_minus_H = jax.vmap(lambda z,x : self.f_inner(z,x, start_inner))(carry['inner_var'].reshape(1, -1) - self.h * inner_directions, carry['outer_var'].reshape(1, -1) - self.h * outer_directions)
+            # Compute f(z_k + h w_ij, x_k, zeta_i) and f(z_k, x_k + h u_ij, zeta_i) for i in batch and j in directions
 
-            ## For g_f,1 and g_f,2
+            fz_plus_outer = fz_values_outer(outer_plus_z, outer_samples)
+            fx_plus_outer = fx_values_outer(outer_plus_x, outer_samples)
 
-            if self.zero_outer_smoothing == 1:
-                f_plus_values_outer_1 = jax.vmap(lambda x : self.f_outer(x, carry['outer_var'], start_outer))(carry['inner_var'].reshape(1, -1) + self.h_outer * inner_directions[:self.l1, :])
-                f_plus_values_outer_2 = jax.vmap(lambda x : self.f_outer(carry['inner_var'], x, start_outer))(carry['outer_var'].reshape(1, -1) + self.h_outer * outer_directions[:self.l1, :])
+            # Compute g(z_k + h w_ij, x_k + h u_ij, xi_i) and g(z_k - h w_ij, x_k - h u_ij, xi_i) for i in batch and j in directions
 
-            else:
-                f_plus_values_outer_1 = jax.vmap(lambda z,x : self.f_outer(z,x, start_outer))(carry['inner_var'].reshape(1, -1) + self.h_outer * inner_directions[:self.l1, :], carry['outer_var'].reshape(1, -1) + self.h_outer * outer_directions[:self.l1, :])
-#            f_plus_values_outer_2 = jax.vmap(lambda x : self.f_outer(carry['inner_var'], x, start_outer))(carry['inner_var'].reshape(1, -1) + self.h * inner_directions[:self.l1, :], carry['outer_var'].reshape(1, -1) + self.h * outer_directions[:self.l1, :])
+            f_cross_plus_inner = g_cross(inner_plus, cross_plus_x, inner_samples)
+            f_cross_minus_inner = g_cross(inner_minus, cross_minus_x, inner_samples)
 
+            # Compute D_z^k
 
-            # Comupte gradient approximations of inner and outer functions
-            g_inner   = ffd(f_plus_values_inner, f_minus_values_inner, inner_directions, 2*self.h)
-            g_outer_1 = ffd(f_plus_values_outer_1, current_f_outer, inner_directions[:self.l1, :], self.h_outer)
+            D_z = self.ffd(f_plus_inner, f_minus_inner, inner_directions[:self.b1, :self.l1, :], 2*self.h)
 
-            if self.zero_outer_smoothing == 1:
-                g_outer_2 = ffd(f_plus_values_outer_2, current_f_outer, outer_directions[:self.l1, :], self.h_outer)
-            else:
-                # g_outer_1 = ffd(f_plus_values_outer_1, current_f_outer, inner_directions[:self.l1, :], self.h)
-                g_outer_2 = ffd(f_plus_values_outer_1, current_f_outer, outer_directions[:self.l1, :], self.h_outer)
-            # Compute Hessian-vector products
+            # Compute D_v^k
 
+            Hv_11 = self.hvp_b1(f_plus_inner, f_minus_inner, current_f_inner[:, None], inner_directions[:self.b1, :self.l1, :], carry['v'], self.h)
+            grad_z_outer = self.ffd(fz_plus_outer, current_f_outer[:, None], inner_directions[:self.b2, :self.l2, :], self.h)
+            D_v = Hv_11 + grad_z_outer
+            
+            # Compute D_x^k
 
-            Hvp_11 = hvp_b1(f_plus_values_inner, f_minus_values_inner, current_f_inner, inner_directions, carry['v'])
+            Hv_12 = self.hvp_cross(f_cross_plus_inner, f_cross_minus_inner, current_f_inner[:, None], inner_directions[:self.b1, :self.l1, :], outer_directions[:self.b1, :self.l1, :], carry['v'], self.h)
+            grad_x_outer = self.ffd(fx_plus_outer, current_f_outer[:, None], outer_directions[:self.b2, :self.l2, :], self.h)
+            D_x = Hv_12 + grad_x_outer
 
-            Hvp_12 = hvp_cross(f_plus_H, f_minus_H, current_f_inner, inner_directions, outer_directions, carry['v'])
+            # Update iterates
 
+            carry['inner_var'] -= inner_step_size * D_z
+            carry['v'] -= inner_step_size * D_v
+            carry['outer_var'] -= outer_step_size * D_x
+            
+            # Update random key
 
-            carry['inner_var'] -= inner_step_size * g_inner
-            carry['v'] -= inner_step_size * (Hvp_11 + g_outer_1)
-            carry['outer_var'] -= outer_step_size * (Hvp_12 + g_outer_2)
-
-            carry['rnd_state_key'] = subkey_outer
+            carry['rnd_state_key'] = subkey
             jax.debug.print("Function Value = {}", self.f_outer(carry['inner_var'], carry['outer_var']))
 
             return carry, _

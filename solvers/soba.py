@@ -22,8 +22,7 @@ class Solver(StochasticJaxSolver):
     parameters = {
         'step_size': [0.1],
         'outer_ratio': [1.0],
-#        'batch_size': [64],
-        'batch_size': [1],
+        'batch_size': [64],
         **StochasticJaxSolver.parameters
     }
 
@@ -80,7 +79,7 @@ class Solver(StochasticJaxSolver):
             carry['inner_var'] -= inner_step_size * grad_inner_var
             carry['v'] -= inner_step_size * (hvp + grad_in_outer)
             carry['outer_var'] -= outer_step_size * (cross_v + grad_out_outer)
-            jax.debug.print("Function Value = {}", self.f_outer(carry['inner_var'], carry['outer_var']))
+            #jax.debug.print("Function Value = {}", self.f_outer(carry['inner_var'], carry['outer_var']))
 
             return carry, _
 
