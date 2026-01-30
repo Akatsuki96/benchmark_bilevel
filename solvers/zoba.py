@@ -3,24 +3,13 @@ from benchmark_utils.stochastic_jax_solver import StochasticJaxSolver
 from benchopt import safe_import_context
 
 with safe_import_context() as import_ctx:
-    from benchmark_utils.learning_rate_scheduler import update_lr
-    from benchmark_utils.learning_rate_scheduler import init_lr_scheduler
-    from benchmark_utils.zeroth_order_approx import _compute_grad_ffd, _hvp_11, _hvp_12
+    from benchmark_utils.learning_rate_scheduler import update_lr, init_lr_scheduler
+    from benchmark_utils.zeroth_order_utils import _compute_grad_ffd, _hvp_11, _hvp_12, get_random_directions, get_random_batch
 
     import jax
     import jax.numpy as jnp
     
     
-def get_random_directions(key, b, l, dim):
-    directions = jax.random.normal(key, shape=(b, l, dim))
-    _, key = jax.random.split(key)
-    return directions, key
-
-def get_random_batch(key, b, n_samples):
-    batch_indices = jax.random.randint(key, shape=(b,), minval=0, maxval=n_samples)
-    _, key = jax.random.split(key)
-    return batch_indices, key
-
 
 class Solver(StochasticJaxSolver):
     """Zeroth-Order Bilevel Algorithm (ZOBA).
@@ -29,7 +18,7 @@ class Solver(StochasticJaxSolver):
     Bilevel Optimization Algorithm", ArXiv 2026."""
     name = 'ZOBA'
 
-    # any parameter defined here is accessible as a class attribute
+
     parameters = {
         'step_size': [0.01], # stepsize for z,v
         'outer_ratio': [2.0], # stepsize for x => stepsize / outer_ratio

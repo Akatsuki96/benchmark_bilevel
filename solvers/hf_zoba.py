@@ -3,23 +3,14 @@ from benchmark_utils.stochastic_jax_solver import StochasticJaxSolver
 from benchopt import safe_import_context
 
 with safe_import_context() as import_ctx:
-    from benchmark_utils.learning_rate_scheduler import update_lr
-    from benchmark_utils.learning_rate_scheduler import init_lr_scheduler
-    from benchmark_utils.zeroth_order_approx import _compute_grad_ffd, _hvp_11, _hvp_12
+    from benchmark_utils.learning_rate_scheduler import update_lr, init_lr_scheduler
+    from benchmark_utils.zeroth_order_utils import _compute_grad_ffd, get_random_directions, get_random_batch
 
     import jax
     import jax.numpy as jnp
     
     
-def get_random_directions(key, b, l, dim):
-    directions = jax.random.normal(key, shape=(b, l, dim))
-    _, key = jax.random.split(key)
-    return directions, key
 
-def get_random_batch(key, b, n_samples):
-    batch_indices = jax.random.randint(key, shape=(b,), minval=0, maxval=n_samples)
-    _, key = jax.random.split(key)
-    return batch_indices, key
 
 
 class Solver(StochasticJaxSolver):
@@ -29,7 +20,7 @@ class Solver(StochasticJaxSolver):
     Bilevel Optimization Algorithm", ArXiv 2026."""
     name = 'HF-ZOBA'
 
-    # any parameter defined here is accessible as a class attribute
+
     parameters = {
         'step_size': [0.01], # stepsize for z,v
         'outer_ratio': [2.0], # stepsize for x => stepsize / outer_ratio
@@ -49,9 +40,6 @@ class Solver(StochasticJaxSolver):
         self.outer_var = self.outer_var0.copy()
         self.rnd_state_key = jax.random.PRNGKey(0)
         self.ffd = jax.jit(_compute_grad_ffd)
-        self.hvp_b1 = jax.jit(_hvp_11)
-        self.hvp_cross = jax.jit(_hvp_12)
-
 
         v = jnp.zeros_like(self.inner_var)
 
@@ -101,17 +89,20 @@ class Solver(StochasticJaxSolver):
 
             fz_values_outer   = jax.vmap(jax.vmap(lambda x, zeta : self.f_outer(x, carry['outer_var'], start=zeta), in_axes=(0, None)), in_axes=(0, 0))
             fx_values_outer   = jax.vmap(jax.vmap(lambda x, zeta : self.f_outer(carry['inner_var'], x, start=zeta), in_axes=(0, None)), in_axes=(0, 0))
+
+            fxv_values_inner   = jax.vmap(jax.vmap(lambda x, xi : self.f_inner(carry['inner_var'] + self.h_bar * carry['v'], x, start=xi), in_axes=(0, None)), in_axes=(0, 0))
             
             # Compute function values in current iterates for every sample i.e. g(z_k, x_k, xi_i) and f(z_k, x_k, zeta_i)
             
             current_f_inner = jax.vmap(lambda xi_i : self.f_inner(carry['inner_var'], carry['outer_var'], start=xi_i), in_axes=(0))(inner_samples)
             current_f_outer = jax.vmap(lambda zeta_i : self.f_outer(carry['inner_var'], carry['outer_var'], start=zeta_i), in_axes=(0))(outer_samples)
 
-            inner_z_plus = carry['inner_var'] + self.h * inner_directions[:self.b1, :self.l1, :]
-            inner_x_plus = carry['outer_var'] + self.h * outer_directions[:self.b1, :self.l1, :]
-            
-            outer_plus_z = carry['inner_var'].reshape(1, -1) + self.h * inner_directions[:self.b2, :self.l2, :]
-            outer_plus_x = carry['outer_var'].reshape(1, -1) + self.h * outer_directions[:self.b2, :self.l2, :]
+            inner_plus = carry['inner_var'] + self.h * inner_directions
+            outer_plus = carry['outer_var'] + self.h * outer_directions
+
+
+            inner_z_plus, inner_x_plus = inner_plus[:self.b1, :self.l1, :], outer_plus[:self.b1, :self.l1, :]            
+            outer_plus_z, outer_plus_x = inner_plus[:self.b2, :self.l2, :], outer_plus[:self.b2, :self.l2, :]
 
 
             # Compute g(z_k + h w_ij, x_k, xi_i) and g(z_k - h w_ij, x_k, xi_i) for i in batch and j in directions
@@ -128,30 +119,23 @@ class Solver(StochasticJaxSolver):
 
             # Compute g(z_k + h_bar v_k + h w_ij, x_k, xi_i) and g(z_k + h_bar v_k, x_k, xi_i)
             fv_z_plus_inner = fz_values_inner(carry['inner_var'] + self.h_bar * carry['v'] + self.h * inner_directions[:self.b1, :self.l1, :], inner_samples)
-            fv_z_current_inner = jax.vmap(lambda xi_i : self.f_inner(carry['inner_var'] + self.h_bar * carry['v'], carry['outer_var'], start=xi_i), in_axes=(0))(inner_samples)# fz_values_inner(carry['inner_var'] + self.h_bar * carry['v'], inner_samples)
-
-            fxv_values_inner   = jax.vmap(jax.vmap(lambda x, xi : self.f_inner(carry['inner_var'] + self.h_bar * carry['v'], x, start=xi), in_axes=(0, None)), in_axes=(0, 0))
-
+            fv_z_current_inner = jax.vmap(lambda xi_i : self.f_inner(carry['inner_var'] + self.h_bar * carry['v'], carry['outer_var'], start=xi_i), in_axes=(0))(inner_samples)
             fxv_plus_inner = fxv_values_inner(carry['outer_var'] + self.h * outer_directions[:self.b1, :self.l1, :] , inner_samples)
             
-            #fv_z_current_inner
 
-
+            # Compute gradients approximations
             grad_inner_z_v = self.ffd(fv_z_plus_inner, fv_z_current_inner[:, None], inner_directions[:self.b1, :self.l1, :], self.h)
             grad_inner_x_v = self.ffd(fxv_plus_inner,  fv_z_current_inner[:, None], outer_directions[:self.b1, :self.l1, :], self.h)
             
             grad_inner_z = self.ffd(fz_plus_inner, current_f_inner[:, None], inner_directions[:self.b1, :self.l1, :], self.h)
             grad_inner_x = self.ffd(fx_plus_inner, current_f_inner[:, None], outer_directions[:self.b1, :self.l1, :], self.h)
-            
-            # Compute D_z^k
-            D_z = grad_inner_z
 
-            # Compute D_v^k
             grad_z_outer = self.ffd(fz_plus_outer, current_f_outer[:, None], inner_directions[:self.b2, :self.l2, :], self.h)
-            D_v = ((grad_inner_z_v - grad_inner_z) / self.h_bar) + grad_z_outer
-            
-            # Compute D_x^k
             grad_x_outer = self.ffd(fx_plus_outer, current_f_outer[:, None], outer_directions[:self.b2, :self.l2, :], self.h)
+            
+            # Compute search directions
+            D_z = grad_inner_z
+            D_v = ((grad_inner_z_v - grad_inner_z) / self.h_bar) + grad_z_outer
             D_x = ((grad_inner_x_v - grad_inner_x)/self.h_bar) + grad_x_outer
 
             # Update iterates
